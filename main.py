@@ -19,7 +19,6 @@ import torch.utils.data
 from torchvision import datasets
 from torchvision import transforms
 import tqdm
-import wandb
 
 import models.densenet
 import models.resnet_v1
@@ -28,151 +27,221 @@ import models.vgg
 import models.wide_resnet
 import util
 
+####################################################################################
+import sys
+sys.path.append('../')
+
+import functools
+from typing import NamedTuple, Any
+import jax
+import jax.numpy as jnp
+from jaxopt._src import base, tree_util
+from jaxopt import OptaxSolver
+import optax
+from VeLO_training.config.optimizer import get_velo_optimizer #VeLO
+
+class OptaxState(NamedTuple):
+  """Named tuple containing state information."""
+  iter_num: int
+  value: float
+  error: float
+  internal_state: NamedTuple
+  aux: Any
+
+# we need to reimplement optax's OptaxSolver's lopt_update method to properly pass in the loss data that VeLO expects.
+def lopt_update(self,
+            params: Any,
+            state: NamedTuple,
+            *args,
+            **kwargs) -> base.OptStep:
+  """Performs one iteration of the optax solver.
+
+  Args:
+    params: pytree containing the parameters.
+    state: named tuple containing the solver state.
+    *args: additional positional arguments to be passed to ``fun``.
+    **kwargs: additional keyword arguments to be passed to ``fun``.
+  Returns:
+    (params, state)
+  """
+  if self.pre_update:
+    params, state = self.pre_update(params, state, *args, **kwargs)
+
+  (value, aux), grad = self._value_and_grad_fun(params, *args, **kwargs)
+
+  # note the only difference between this function and the baseline 
+  # optax.OptaxSolver.lopt_update is that `extra_args` is now passed.
+  # if you would like to use a different optimizer, you will likely need to
+  # remove these extra_args.
+
+  # delta is like the -learning_rate * grad, though more complex in VeLO (detail in paper)
+  delta, opt_state = self.opt.update(
+    grad, state.internal_state, params, extra_args={"loss": value}
+  )
+  # applies the actual update to parameters
+  params = self._apply_updates(params, delta)
+
+  # Computes optimality error before update to re-use grad evaluation.
+  new_state = OptaxState(iter_num=state.iter_num + 1,
+                          error=tree_util.tree_l2_norm(grad),
+                          value=value,
+                          aux=aux,
+                          internal_state=opt_state)
+  # return both updated params and training state used in the next iteration of training
+  return base.OptStep(params=params, state=new_state)
+####################################################################################
+
+
 flags.DEFINE_string('dataset_root', None, 'Path to data.', required=True)
 flags.DEFINE_bool('download', False, 'Download dataset.')
 flags.DEFINE_integer('eval_batch_size', 128, 'Batch size to use during evaluation.')
 flags.DEFINE_integer('loader_num_workers', 4, 'num_workers for DataLoader')
 flags.DEFINE_integer('loader_prefetch_factor', 2, 'prefetch_factor for DataLoader')
+flags.DEFINE_string('optimizer', None, 'Optimizer name', required=True)
 config_flags.DEFINE_config_file('config')
 
 FLAGS = flags.FLAGS
-
+ 
 Dataset = torch.utils.data.Dataset
 ModuleDef = Callable[..., nn.Module]
 
-
 def main(_):
     config = ml_collections.ConfigDict(FLAGS.config)
-
-    wandb.init(project='flax-cifar')
-    wandb.config.update(config.to_dict())
-
+ 
+    # Data loaders
     num_classes, input_shape, train_dataset, val_dataset = setup_data()
     train_loader = torch.utils.data.DataLoader(
-        dataset=train_dataset,
-        batch_size=config.train.batch_size,
-        shuffle=True,
-        pin_memory=False,
-        num_workers=FLAGS.loader_num_workers,
-        prefetch_factor=FLAGS.loader_prefetch_factor)
+        train_dataset, batch_size=config.train.batch_size, shuffle=True,
+        num_workers=FLAGS.loader_num_workers, prefetch_factor=FLAGS.loader_prefetch_factor)
     val_loader = torch.utils.data.DataLoader(
-        dataset=val_dataset,
-        batch_size=FLAGS.eval_batch_size,
-        shuffle=False,
-        pin_memory=False,
-        num_workers=FLAGS.loader_num_workers,
-        prefetch_factor=FLAGS.loader_prefetch_factor)
+        val_dataset,   batch_size=FLAGS.eval_batch_size, shuffle=False,
+        num_workers=FLAGS.loader_num_workers, prefetch_factor=FLAGS.loader_prefetch_factor)
 
-    norm = nn.BatchNorm
-    norm_kwargs = lambda train: {'use_running_average': not train}
-
-    model = make_model(config, num_classes, input_shape, norm=norm)
-    rng_init, _ = random.split(random.PRNGKey(0))
-    init_vars = model.init(rng_init, jnp.zeros((1,) + input_shape), norm_kwargs=norm_kwargs(train=True))
+    # Model init
+    norm_kwargs = lambda t: {'use_running_average': not t}
+    model = make_model(config, num_classes, input_shape, norm=nn.BatchNorm)
+    rng = random.PRNGKey(0)
+    init_vars = model.init(rng, jnp.zeros((1,)+input_shape), norm_kwargs=norm_kwargs(True))
     params, batch_stats = init_vars['params'], init_vars['batch_stats']
-
-    print('params:')
-    sys.stdout.writelines(x + '\n' for x in util.dict_tree_format(util.tree_shape(params)))
-    print('batch_stats:')
-    sys.stdout.writelines(x + '\n' for x in util.dict_tree_format(util.tree_shape(batch_stats)))
-    sys.stdout.flush()
 
     def filter_kernel_params(tree):
         return [x for path, x in util.dict_tree_items(tree) if path[-1] == 'kernel']
-
-    print('total number of params:',
-          tree_util.tree_reduce(np.add, tree_util.tree_map(lambda x: np.prod(x.shape), params)))
-    print('number of linear layers:', sum(1 for _ in filter_kernel_params(params)))
-
-    total_steps = config.train.num_epochs * len(train_loader)
-    schedule = optax.cosine_decay_schedule(config.train.base_learning_rate, total_steps)
-    tx = optax.sgd(schedule, momentum=0.9)
-    opt_state = tx.init(params)
-
-    loss_with_logits = jax.vmap(jaxopt.loss.multiclass_logistic_loss)
-
-    def objective_fn(params, mutable_vars, data):
-        # Designed for use with jax.value_and_grad(..., has_aux=True).
-        # Params are a separate arg (arg 0).
-        # Returns scalar loss and one auxiliary output.
+    
+    def loss_fun(params, data, mutable_vars):
         inputs, labels = data
         model_vars = {'params': params, **mutable_vars}
-        outputs, mutated_vars = model.apply(
-            model_vars, inputs, norm_kwargs=norm_kwargs(train=True),
-            mutable=list(mutable_vars.keys()))
-        example_loss = loss_with_logits(labels, outputs)
-        data_loss = jnp.mean(example_loss)
-        if config.train.weight_decay_vars == 'all':
-            wd_vars = list(tree_util.tree_leaves(params))
-        elif config.train.weight_decay_vars == 'kernel':
-            wd_vars = filter_kernel_params(params)
-        else:
-            raise ValueError('unknown variable collection', config.train.weight_decay_vars)
+        logits, mutated_vars = model.apply(model_vars, inputs, norm_kwargs=norm_kwargs(True), mutable=['batch_stats'])
+
+        # Use integer labels for stable loss
+        #labels_int = labels_int.argmax(axis=-1).astype(jnp.int32)
+        loss = jnp.mean(optax.softmax_cross_entropy(logits, labels))
+
+        wd_vars = list(tree_util.tree_leaves(params)) if config.train.weight_decay_vars == 'all' else filter_kernel_params(params)
         wd_loss = 0.5 * sum(jnp.sum(jnp.square(x)) for x in wd_vars)
-        objective = data_loss + config.train.weight_decay * wd_loss
-        return objective, (outputs, mutated_vars)
+        loss_val = loss + config.train.weight_decay * wd_loss
 
+        return loss_val, mutated_vars['batch_stats']
+
+    # Setup OptaxSolver for any optimizer
+    total_steps = config.train.num_epochs * len(train_loader)
+    # base optimizer selection
+    if FLAGS.optimizer == 'velo':
+        base_opt = get_velo_optimizer(total_steps)
+    elif FLAGS.optimizer == 'sgd':
+        schedule = optax.cosine_decay_schedule(config.train.base_learning_rate, total_steps)
+        base_opt = optax.sgd(schedule)
+    elif FLAGS.optimizer == 'sgdm':
+        schedule = optax.cosine_decay_schedule(config.train.base_learning_rate, total_steps)
+        base_opt = optax.sgd(schedule, momentum=config.train.momentum)
+    elif FLAGS.optimizer == 'adam':
+        schedule = optax.cosine_decay_schedule(config.train.base_learning_rate, total_steps)
+        base_opt = optax.adam(schedule)
+    elif FLAGS.optimizer == 'adamw':
+        schedule = optax.cosine_decay_schedule(config.train.base_learning_rate, total_steps)
+        base_opt = optax.adamw(schedule, weight_decay=config.train.adam_weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {FLAGS.optimizer}")
+
+    # wrap in OptaxSolver
+    solver = OptaxSolver(
+        opt=base_opt,
+        fun=jax.value_and_grad(loss_fun, has_aux=True),
+        maxiter=total_steps,
+        has_aux=True,
+        value_and_grad=True,
+    )
+    import types
+    # Step 2: Attach lopt_update as a bound method
+    solver.lopt_update = types.MethodType(lopt_update, solver)
+
+    # initialize solver state using a sample batch
+    # sample_inputs, sample_labels = next(iter(train_loader)) #one batch of data
+    #convert to array change shape from (128, 3, 32, 32) to (128, 32, 32, 3)
+    # x0 = jnp.moveaxis(jnp.asarray(sample_inputs.numpy()), -3, -1) 
+    # # convert to jnp
+    # y0_int = jnp.asarray(sample_labels.numpy())
+    # # one-hot encode
+    # y0 = jax.nn.one_hot(y0_int, num_classes)
+
+    # grab one TRAIN batch to init state
+    batch0 = next(iter(train_loader))
+    # move PyTorch (N,C,H,W) → JAX (N,H,W,C)
+    x0 = jnp.moveaxis(jnp.asarray(batch0[0].numpy()), -3, -1)
+    y0 = jax.nn.one_hot(jnp.asarray(batch0[1].numpy()), num_classes)
+
+    state = solver.init_state(params, (x0, y0), batch_stats)
+
+    # choose update fn: custom for velo, default for others
+    jitted_update = jax.jit(functools.partial(lopt_update, self=solver)) if FLAGS.optimizer == 'velo' else jax.jit(solver.update)
+    
+    # Eval function
     @jax.jit
-    def train_step(opt_state, params, mutable_vars, data):
-        objective_and_grad_fn = jax.value_and_grad(objective_fn, has_aux=True)
-        (objective, aux), grads = objective_and_grad_fn(params, mutable_vars, data)
-        outputs, mutated_vars = aux
-        updates, opt_state = tx.update(grads, opt_state)
-        params = optax.apply_updates(params, updates)
-        return opt_state, params, mutated_vars, objective, outputs
+    def eval_step(params, batch_stats, x):
+        return model.apply({'params': params, 'batch_stats': batch_stats}, x, norm_kwargs=norm_kwargs(False))
 
-    @jax.jit
-    def apply_model(params, batch_stats, inputs):
-        return model.apply(
-            {'params': params, 'batch_stats': batch_stats}, inputs,
-            norm_kwargs=norm_kwargs(train=False))
-
+    # Training & Validation loop
     for epoch in range(config.train.num_epochs + 1):
-        metrics = {}
-
+        train_accs, train_losses = [], []
         if epoch > 0:
-            train_outputs = collections.defaultdict(list)
-            for inputs, labels in tqdm.tqdm(train_loader, f'train epoch {epoch}'):
-                inputs, labels = jnp.asarray(inputs.numpy()), jnp.asarray(labels.numpy())
-                inputs = jnp.moveaxis(inputs, -3, -1)
-                opt_state, params, mutated_vars, objective, logits = train_step(
-                    opt_state, params, {'batch_stats': batch_stats}, (inputs, labels))
-                batch_stats = mutated_vars['batch_stats']
-                loss = loss_with_logits(labels, logits)
-                pred = jnp.argmax(logits, axis=-1)
-                acc = (pred == labels)
-                train_outputs['acc'].append(acc)
-                train_outputs['loss'].append(loss)
-                train_outputs['objective'].append([objective])
-            train_outputs = {k: np.concatenate(v) for k, v in train_outputs.items()}
-            metrics.update({
-                'train_loss': np.mean(train_outputs['loss']),
-                'train_acc': np.mean(train_outputs['acc']),
-                'train_objective': np.mean(train_outputs['objective']),
-            })
+            for inputs, labels in tqdm.tqdm(train_loader, desc=f"train ep {epoch}"):
 
-        val_outputs = collections.defaultdict(list)
-        for inputs, labels in tqdm.tqdm(val_loader, f'val epoch {epoch}'):
-            inputs, labels = jnp.asarray(inputs.numpy()), jnp.asarray(labels.numpy())
-            inputs = jnp.moveaxis(inputs, -3, -1)
-            logits = apply_model(params, batch_stats, inputs)
-            loss = loss_with_logits(labels, logits)
-            pred = jnp.argmax(logits, axis=-1)
-            acc = (pred == labels)
-            val_outputs['acc'].append(acc)
-            val_outputs['loss'].append(loss)
-        val_outputs = {k: np.concatenate(v) for k, v in val_outputs.items()}
-        metrics.update({
-            'val_loss': np.mean(val_outputs['loss']),
-            'val_acc': np.mean(val_outputs['acc']),
-        })
+                # change shape first because it is PyTorch otherwise shape error with JAX
+                x = jnp.moveaxis(jnp.asarray(inputs.numpy()), -3, -1)
+                y_int = jnp.asarray(labels.numpy())
+                y = jax.nn.one_hot(y_int, num_classes)
+                # update
+                params, state = jitted_update(params, state, (x, y), batch_stats)
+                batch_stats = state.aux
 
-        wandb.log(metrics)
-        if epoch == 0:
-            print('epoch {:d}: val_acc {:.2%}'.format(epoch, metrics['val_acc']))
-        else:
-            print('epoch {:d}: val_acc {:.2%}, train_objective {:.6g}'.format(
-                epoch, metrics['val_acc'], metrics['train_objective']))
+                logits = eval_step(params, batch_stats, x)
+                loss = optax.softmax_cross_entropy(logits, y).mean().item()
+                acc = (jnp.argmax(logits, axis=-1) == y).mean().item()
+
+                train_accs.append(acc)
+                train_losses.append(loss)
+
+        # Validate at epoch 0 first 
+        # Validation
+        val_accs, val_losses = [], []
+        for inputs, labels in tqdm.tqdm(val_loader, desc=f"val ep {epoch}"):
+            x = jnp.moveaxis(jnp.asarray(inputs.numpy()), -3, -1)
+            y_int = jnp.asarray(labels.numpy())
+            y = jax.nn.one_hot(y_int, num_classes)
+
+            logits = eval_step(params, batch_stats, x)
+            loss = optax.softmax_cross_entropy(logits, y).mean().item()
+            acc = (jnp.argmax(logits, axis=-1) == y).mean().item()
+
+            val_losses.append(loss)
+            val_accs.append(acc)
+
+        train_acc = float(np.mean(train_accs))
+        train_loss = float(np.mean(train_losses))
+        val_loss = float(np.mean(val_losses))
+        val_acc  = float(np.mean(val_accs))
+
+        print(f"Epoch {epoch}: train_acc={train_acc:.4f}, train_loss={train_loss:.4f}, val_acc={val_acc:.4f}, val_loss={val_loss:.4f}")
+
 
 
 def setup_data() -> Tuple[int, Tuple[int, int, int], Dataset, Dataset]:
