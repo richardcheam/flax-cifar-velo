@@ -19,6 +19,5 @@ numpy
 torch
 torchvision
 tqdm
-wandb
 ```
 To install jax with CUDA, refer to the [installation instructions](https://github.com/google/jax#installation).
