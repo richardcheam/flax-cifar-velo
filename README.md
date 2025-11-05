@@ -1,4 +1,4 @@
-This repo was adapted to train CIFAR with VeLO
+# This repo was adapted to train CIFAR with VeLO
 
 ### Usage
 
