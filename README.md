@@ -1,4 +1,4 @@
-# This repo was adapted to train CIFAR with VeLO
+# This repo was adapted to train CIFAR with VeLO. More information available [here](https://github.com/richardcheam/FLAX-VeLO) !
 
 ### Usage
 
